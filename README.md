@@ -19,12 +19,6 @@ All experiments use **COCO-MLT** (Wu et al., 2020): 1,909 training images and 80
 33 medium and 25 tail), evaluated on the 5,000 COCO val2017 images, with frozen CLIP ViT-B/16
 features.
 
-## Notebooks
-
-Run them in this order, all from this folder. Every cell prints what it did. The training notebooks
-run self-tests before training, and downloads, features and finished runs are saved, so running a
-notebook again continues where it stopped.
-
 | Notebook | What it does |
 |---|---|
 | `coco_mlt_context_check.ipynb` | Downloads the COCO-MLT split (checked against pinned SHA-256 hashes), the COCO 2017 annotations and the 6,909 images; builds the labels; extracts frozen CLIP ViT-B/16 features; trains linear classifiers with BCE, ASL and DB-Focal (3 seeds); runs the context-reliance check (diagnostic study) |
