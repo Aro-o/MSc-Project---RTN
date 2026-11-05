@@ -1,0 +1,19 @@
+# Data, features, saved runs and results (downloaded or created by the notebooks)
+coco_mlt/
+# CLIP weights
+model_cache/
+*.pt
+*.pth
+*.npz
+*.npy
+*.zip
+
+# Python and Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Operating system
+.DS_Store
+Thumbs.db
+desktop.ini
