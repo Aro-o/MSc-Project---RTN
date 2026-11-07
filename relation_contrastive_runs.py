@@ -20,7 +20,10 @@ from scipy import sparse
 import relation_contrastive_method as rcm
 
 MODE_OF = {"uniform": "uniform", "relation": "relation", "companions": "relation",
-           "schane": "schane", "lcl": "lcl", "relation_schane": "relation_schane"}
+           "schane": "schane", "lcl": "lcl", "relation_schane": "relation_schane",
+           # round 6: positive-side variants
+           "any": "any", "all": "all", "simdiss": "simdiss",
+           "mul_simdiss": "mul_simdiss", "relation_simdiss": "relation_simdiss"}
 HEARTBEAT_TIMEOUT = float(os.environ.get("RC_HEARTBEAT_TIMEOUT", 180))  # s without the notebook -> workers stop
 
 
@@ -74,7 +77,8 @@ def prepare_data(data, dev_frac, split_seed, related_pct, device):
 
 
 def pretrain_kwargs(kind, setting, D):
-    relation = (D["RELATION"] if kind in ("relation", "relation_schane") else
+    relation = (D["RELATION"] if kind in ("relation", "relation_schane",
+                                          "relation_simdiss") else
                 D["COMPANION"] if kind == "companions" else None)
     return dict(mode=MODE_OF[kind], relation=relation,
                 alpha=setting.get("alpha", 0.0), tau=setting.get("tau"))

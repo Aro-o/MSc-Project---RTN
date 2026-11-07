@@ -7,7 +7,22 @@
 # label of an anchor separately), WeightedSupCon loss with 1/len(rows)
 # weights, 50% feature masking, Adam + cosine warm restarts, then fine-tuning
 # with BCE (backbone lr x0.1, ReduceLROnPlateau, early stopping on a dev set).
-# The other variants change only how negatives are weighted inside that loss.
+# The other variants change only how negatives are weighted inside that loss,
+# except the round-6 variants, which change the positives:
+#   ALL / ANY (image anchors): positives are candidates with the same label
+#                 set / sharing at least one label (binary definitions).
+#   Similarity-Dissimilarity (Huang, Long and Luo, TMLR 2026, Eqs. 13-15):
+#                 ANY positives, each weighted by K_s x K_d with
+#                 K_s = |S n T| / |S| and K_d = 1 / (1 + |T \ (S n T)|),
+#                 S the anchor's and T the candidate's label set.
+#                 As printed, Eq. 13 puts the factor inside the log, where it
+#                 adds a constant and leaves the gradients equal to ANY's (the
+#                 self-test shows this); the factor is therefore applied to
+#                 each positive's log-probability term, which is what changes
+#                 how strongly each positive is pulled.
+#   mul_simdiss / relation_simdiss: MulSupCon's per-label anchors with the
+#                 same positive weights, with uniform or relation-typed
+#                 negatives (the positives x negatives comparison).
 #
 # SCHaNe (Long et al. 2023) and LCL (Suresh & Ong 2021) have no official code
 # for this setting; their weights are implemented from the papers' equations:
@@ -271,12 +286,23 @@ def mulsupcon_loss(scores, batch_labels, ref_labels, tau, mode="uniform",
                    (value, mask matrix L x L)); positives 1
       relation_schane : negatives w = beta (SCHaNe, Eq. 3) x (1 + alpha *
                    max_c R[k, c]); positives 1 (round-2 combination)
+      mul_simdiss / relation_simdiss : positive p of a row from anchor image i
+                   counts K_s(i, p) x K_d(i, p) times (its log-probability term
+                   is multiplied by that factor); negatives uniform / as in
+                   'relation' (round 6)
+      any / all / simdiss : image anchors (one row per image), see
+                   image_supcon_loss_reference
     """
+    if mode in IMAGE_MODES:
+        return image_supcon_loss_reference(scores, batch_labels, ref_labels, tau, mode)
     img_idx, lab_idx = torch.where(batch_labels == 1)
     logits = scores[img_idx] / tau                        # R x Q
     pos = ref_labels[:, lab_idx].T > 0.5                  # R x Q
     n_pos = pos.sum(1)
-    if mode == "uniform":
+    pos_w = torch.ones_like(logits)
+    if mode in POSW_MODES:
+        pos_w = simdiss_weights(batch_labels, ref_labels)[img_idx]
+    if mode in ("uniform", "mul_simdiss"):
         log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
     else:
         if mode == "schane":
@@ -291,7 +317,7 @@ def mulsupcon_loss(scores, batch_labels, ref_labels, tau, mode="uniform",
             w_cand = (pa.unsqueeze(1) * ref_labels.unsqueeze(0)).amax(2)  # R x Q
             w = torch.where(pos, w_pos.expand_as(logits), w_cand)
             logw = torch.log(w.clamp_min(1e-6))
-        elif mode == "relation":
+        elif mode in ("relation", "relation_simdiss"):
             score = torch.zeros_like(logits)
             refT = ref_labels.T                                         # C x Q
             for value, M in relation:
@@ -315,8 +341,69 @@ def mulsupcon_loss(scores, batch_labels, ref_labels, tau, mode="uniform",
             raise ValueError(mode)
         z = logits + logw
         log_prob = z - torch.logsumexp(z, dim=1, keepdim=True)
-    per_row = -(log_prob * pos).sum(1) / n_pos
+    per_row = -(log_prob * pos * pos_w).sum(1) / n_pos
     return per_row.mean()
+
+
+IMAGE_MODES = ("any", "all", "simdiss")
+POSW_MODES = ("mul_simdiss", "relation_simdiss")
+
+
+def simdiss_weights(batch_labels, ref_labels):
+    """Similarity x dissimilarity factor (Huang, Long and Luo, 2026, Eqs.
+    14-15) for every (anchor image, candidate) pair, B x Q:
+    K_s = |S n T| / |S| and K_d = 1 / (1 + |T \\ (S n T)|), where S is the
+    anchor's label set and T the candidate's. 0 when they share no label."""
+    inter = batch_labels @ ref_labels.T                          # |S n T|
+    n_s = batch_labels.sum(1, keepdim=True).clamp_min(1)         # |S|
+    n_t = ref_labels.sum(1).unsqueeze(0)                         # |T|
+    return (inter / n_s) / (1.0 + (n_t - inter))
+
+
+def image_supcon_loss_reference(scores, batch_labels, ref_labels, tau, mode):
+    """Row-by-row definition of the image-anchor losses (Huang et al., 2026,
+    Eqs. 1-4 and 13): one row per anchor image i with at least one label;
+    positives P(i): candidates whose label set equals S (ALL) or shares a
+    label with S (ANY, simdiss); every candidate is in the denominator.
+    Row loss: -(1/|P(i)|) sum_p w_p log softmax(s_i / tau)_p, with w_p = 1
+    (ALL, ANY) or K_s K_d (simdiss). Rows are averaged."""
+    rows = []
+    for i in range(batch_labels.shape[0]):
+        S = batch_labels[i] > 0.5
+        if not bool(S.any()):
+            continue
+        log_prob = torch.log_softmax(scores[i] / tau, dim=0)
+        terms = []
+        for p in range(ref_labels.shape[0]):
+            T = ref_labels[p] > 0.5
+            shared = int((S & T).sum())
+            if mode == "all":
+                if bool(torch.equal(S, T)):
+                    terms.append(-log_prob[p])
+            elif shared > 0:
+                w = 1.0
+                if mode == "simdiss":
+                    w = (shared / int(S.sum())) / (1 + int((T & ~S).sum()))
+                terms.append(-w * log_prob[p])
+        if terms:
+            rows.append(torch.stack(terms).sum() / len(terms))
+    return torch.stack(rows).mean()
+
+
+def simdiss_as_printed_loss(scores, batch_labels, ref_labels, tau):
+    """Eq. 13 exactly as printed: the factor inside the log, multiplying the
+    positive's exponential in the numerator only. Used only by the self-test,
+    to show that its gradients equal ANY's (log K is a constant)."""
+    logits = scores / tau
+    inter = batch_labels @ ref_labels.T
+    pos = inter > 0.5
+    W = simdiss_weights(batch_labels, ref_labels)
+    log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+    terms = (torch.log(W.clamp_min(1e-12)) + log_prob) * pos
+    n_pos = pos.sum(1)
+    keep = (batch_labels.sum(1) > 0.5) & (n_pos > 0)
+    row = -terms.sum(1) / n_pos.clamp_min(1)
+    return (row * keep).sum() / keep.sum().clamp_min(1)
 
 
 def mulsupcon_loss_vec(scores, batch_labels, ref_labels, tau, mode="uniform",
@@ -326,6 +413,22 @@ def mulsupcon_loss_vec(scores, batch_labels, ref_labels, tau, mode="uniform",
     Rows whose label is absent from the anchor are computed and discarded.
     Shapes: scores B x Q, batch_labels B x C, ref_labels Q x C."""
     logits = scores / tau                                   # B x Q
+    if mode in IMAGE_MODES:                                 # one row per image
+        inter = batch_labels @ ref_labels.T                 # B x Q: |S n T|
+        n_s, n_t = batch_labels.sum(1), ref_labels.sum(1)
+        if mode == "all":
+            pos = (((inter - n_s[:, None]).abs() < 0.5)
+                   & ((inter - n_t[None, :]).abs() < 0.5))
+        else:
+            pos = inter > 0.5
+        w = pos.to(logits.dtype)
+        if mode == "simdiss":
+            w = w * simdiss_weights(batch_labels, ref_labels)
+        log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+        n_pos = pos.sum(1)
+        keep = (n_s > 0.5) & (n_pos > 0)
+        row = -(w * log_prob).sum(1) / n_pos.clamp_min(1)
+        return (row * keep).sum() / keep.sum().clamp_min(1)
     ref = ref_labels                                        # Q x C (0/1 float)
     refT = ref.T                                            # C x Q
     n_pos = ref.sum(0)                                      # C
@@ -334,6 +437,21 @@ def mulsupcon_loss_vec(scores, batch_labels, ref_labels, tau, mode="uniform",
     if mode == "uniform":
         den = torch.logsumexp(logits, dim=1, keepdim=True)  # B x 1
         row = -(pos_sum / n_pos.clamp_min(1) - den)         # B x C
+    elif mode in POSW_MODES:
+        W = simdiss_weights(Yb, ref)                        # B x Q
+        wpos_sum = (W * logits) @ ref                       # B x C: sum_p w_p logit_p
+        wsum = W @ ref                                      # B x C: sum_p w_p
+        if mode == "mul_simdiss":
+            den = torch.logsumexp(logits, dim=1, keepdim=True)          # B x 1
+        else:
+            score = torch.zeros_like(refT)                  # C x Q
+            for value, M in relation:
+                has = (M @ refT) > 0.5
+                score = torch.maximum(score, has.to(logits.dtype) * value)
+            lw = torch.where(refT > 0.5, torch.zeros_like(score),
+                             torch.log1p(alpha * score))    # C x Q
+            den = torch.logsumexp(logits.unsqueeze(1) + lw.unsqueeze(0), dim=2)  # B x C
+        row = -(wpos_sum - den * wsum) / n_pos.clamp_min(1)
     else:
         posmask = refT.unsqueeze(0) > 0.5                   # 1 x C x Q
         if mode == "relation":
