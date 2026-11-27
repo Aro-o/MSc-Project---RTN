@@ -1,19 +1,23 @@
-# Data, features, saved runs and results (downloaded or created by the notebooks)
 coco_mlt/
-# CLIP weights
+voc_mlt/
+VOCdevkit/
 model_cache/
+*.npy
+*.npz
 *.pt
 *.pth
-*.npz
-*.npy
+*.pkl
+*.tar
 *.zip
-
-# Python and Jupyter
+*.bak
 __pycache__/
 *.pyc
+*.pyo
 .ipynb_checkpoints/
-
-# Operating system
-.DS_Store
+.venv/
+venv/
+.vscode/
+.idea/
 Thumbs.db
 desktop.ini
+.DS_Store
